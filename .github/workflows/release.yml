@@ -1,0 +1,30 @@
+name: Build Cloudy.exe
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile Cloudy.exe (Native Win32 C)
+        shell: pwsh
+        run: |
+          rc.exe /nologo /fo cloudy.res src/cloudy.rc
+          cl.exe /nologo /Os /GS- /Zl /c src/cloudy.c /Focloudy.obj
+          link.exe /nologo /SUBSYSTEM:WINDOWS /ENTRY:WinMainCRTStartup /NODEFAULTLIB /OUT:Cloudy.exe cloudy.obj cloudy.res kernel32.lib advapi32.lib user32.lib shell32.lib
+
+      - name: Upload Cloudy.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cloudy-Windows-x64
+          path: |
+            Cloudy.exe
+            Crea-Shortcut-Desktop.bat
+            README.md
