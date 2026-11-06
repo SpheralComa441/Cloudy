@@ -6,6 +6,9 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -28,3 +31,12 @@ jobs:
             Cloudy.exe
             Crea-Shortcut-Desktop.bat
             README.md
+
+      - name: Publish GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release upload ${{ github.ref_name }} Cloudy.exe Crea-Shortcut-Desktop.bat --clobber || `
+          gh release create ${{ github.ref_name }} Cloudy.exe Crea-Shortcut-Desktop.bat --title "Cloudy ${{ github.ref_name }}" --generate-notes
