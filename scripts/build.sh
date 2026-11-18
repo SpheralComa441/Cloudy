@@ -30,6 +30,11 @@ EXPORTS
     Process32NextW
     CreateMutexW
     OpenMutexW
+    ReleaseMutex
+    CreateEventW
+    SetEvent
+    ResetEvent
+    WaitForMultipleObjects
     GetLastError
     GetTickCount
     GetModuleFileNameW
