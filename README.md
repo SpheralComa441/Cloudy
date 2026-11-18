@@ -61,3 +61,4 @@ Cloudy is written in freestanding Win32 C ([`src/cloudy.c`](src/cloudy.c)) with 
 
 - **On Windows (zero tools required)**: Double-click [`Build-Local.bat`](Build-Local.bat) to compile using the `.NET Framework` `csc.exe` compiler preinstalled on every Windows 10/11 machine.
 - **Cross-compile with Clang/LLD**: Run [`./scripts/build.sh`](scripts/build.sh).
+- **Releases**: pushing a `v*` tag (or running the workflow manually with a tag) builds `Cloudy.exe` from source with GitHub Actions ([`release.yml`](.github/workflows/release.yml)) and publishes it with its SHA-256 checksum. The same build also runs on every push to `main` and every pull request.
