@@ -35,10 +35,11 @@ The quickest way to find out:
 
 ### Compatibility
 
-| GPU | Monitor / VRR | Mode that works | Result | Notes |
-| :--- | :--- | :--- | :---: | :--- |
-| NVIDIA GeForce RTX 50 series (some cards) | — | `dcomp` | ✅ | `gpu` alone was not enough; `--disable-direct-composition` was needed. |
-| — | G-Sync, frames delivered in bursts | none | ❌ | GPU compositing conflict ruled out by the reporter: not a case Cloudy can fix. |
+| GPU | Driver | Monitor / VRR | Windows | Mode that works | Result | Notes |
+| :--- | :--- | :--- | :--- | :--- | :---: | :--- |
+| NVIDIA GeForce RTX 5080 | 621.24 | LG C4 evo (G-Sync Compatible) | 11 | `gpu` | ✅ | Maintainer's setup (AMD Ryzen 9 9950X3D). |
+| NVIDIA GeForce RTX 50 series (some cards) | — | — | — | `dcomp` | ✅ | `gpu` alone was not enough; `--disable-direct-composition` was needed. |
+| — | — | G-Sync, frames delivered in bursts | — | none | ❌ | GPU compositing conflict ruled out by the reporter: not a case Cloudy can fix. |
 
 To add your setup, open an issue with: GPU and driver version, monitor model with refresh rate and VRR technology (G-Sync / G-Sync Compatible / FreeSync), Windows version, which Cloudy mode works (or none), and the text of `Cloudy.exe --status`.
 
@@ -105,7 +106,7 @@ Any other arguments passed to `Cloudy.exe` are forwarded (correctly quoted) to `
 
 ## Building from Source
 
-There is a single implementation: [`src/cloudy.c`](src/cloudy.c), freestanding Win32 C with no C runtime (`-nostdlib`), linking only against core Windows DLLs (`kernel32.dll`, `advapi32.dll`, `user32.dll`, `shell32.dll`, `ntdll.dll`). It is exactly what the releases ship. (Up to v1.1.0 there was also a C# copy built by `Build-Local.bat`; it was removed so that a local build and the release are the same program.)
+There is a single implementation: [`src/cloudy.c`](src/cloudy.c), freestanding Win32 C with no C runtime (`-nostdlib`), linking only against core Windows DLLs (`kernel32.dll`, `advapi32.dll`, `user32.dll`, `shell32.dll`, `ntdll.dll`). It is exactly what the releases ship. The repository contains no prebuilt binary: `Cloudy.exe` is only published on the Releases page, built by GitHub Actions from this source. (Up to v1.1.0 there was also a C# copy built by `Build-Local.bat`, and a `Cloudy.exe` committed in the repository; both were removed so that there is only one program and one way to build it.)
 
 - **Linux or WSL (Ubuntu 24.04)**: `sudo apt install clang lld llvm`, then run [`./scripts/build.sh`](scripts/build.sh). This is the same toolchain the release workflow uses.
 - **Without building**: every push to `main` and every pull request is built by GitHub Actions; the `Cloudy` artifact of a workflow run contains `Cloudy.exe` and its SHA-256.

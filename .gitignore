@@ -3,3 +3,7 @@ build/
 *.res
 *.lib
 *.def
+
+# Build output: Cloudy.exe is published only by the release workflow
+/Cloudy.exe
+/Cloudy.exe.sha256
