@@ -59,6 +59,7 @@ typedef WCHAR *LPWSTR;
 #define INFINITE           0xFFFFFFFF
 #define WAIT_OBJECT_0      0x00000000
 #define WAIT_TIMEOUT       0x00000102
+#define WAIT_ABANDONED     0x00000080
 
 #define PROCESS_TERMINATE                 0x00000001
 #define PROCESS_QUERY_LIMITED_INFORMATION 0x00001000
@@ -85,12 +86,14 @@ typedef WCHAR *LPWSTR;
 #define CONFIG_NAME        L"Cloudy.ini"
 
 #define GUARDIAN_MUTEX     L"Local\\Cloudy.Guardian"
+#define GUARDIAN_STOP      L"Local\\Cloudy.Guardian.Stop"
 
 /* Guardian tuning */
 #define GUARD_POLL_MS      2000     /* poll interval while Claude is NOT running */
 #define GUARD_GRACE_MS     180000   /* after Claude exits, wait this long for an updater relaunch */
 #define GUARD_MAX_RESTARTS 3        /* consecutive fix attempts before giving up (avoid loops) */
 #define KILL_TIMEOUT_MS    5000
+#define GUARD_TAKEOVER_MS  15000    /* how long a new launch waits for the old guardian to step down */
 
 typedef struct _FILETIME {
     DWORD dwLowDateTime;
@@ -200,6 +203,11 @@ __declspec(dllimport) BOOL __stdcall Process32NextW(HANDLE hSnapshot, PROCESSENT
 __declspec(dllimport) HANDLE __stdcall CreateMutexW(SECURITY_ATTRIBUTES *lpMutexAttributes, BOOL bInitialOwner, LPCWSTR lpName);
 __declspec(dllimport) HANDLE __stdcall OpenMutexW(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName);
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
+__declspec(dllimport) BOOL __stdcall ReleaseMutex(HANDLE hMutex);
+__declspec(dllimport) HANDLE __stdcall CreateEventW(SECURITY_ATTRIBUTES *lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCWSTR lpName);
+__declspec(dllimport) BOOL __stdcall SetEvent(HANDLE hEvent);
+__declspec(dllimport) BOOL __stdcall ResetEvent(HANDLE hEvent);
+__declspec(dllimport) DWORD __stdcall WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles, BOOL bWaitAll, DWORD dwMilliseconds);
 __declspec(dllimport) DWORD __stdcall GetTickCount(void);
 __declspec(dllimport) DWORD __stdcall GetModuleFileNameW(HINSTANCE hModule, LPWSTR lpFilename, DWORD nSize);
 __declspec(dllimport) HANDLE __stdcall CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, SECURITY_ATTRIBUTES *lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
@@ -442,9 +450,13 @@ static int cmd_has_switch(LPCWSTR cmd, LPCWSTR sw) {
     return 0;
 }
 
+/* 1 if `cmd` carries exactly the fix switches Cloudy launches Claude with (those of the
+   selected mode, plus any the user forwarded explicitly). An extra switch counts as a
+   mismatch too, so that switching e.g. from "both" to "gpu" really drops
+   --disable-direct-composition. */
 static int cmd_has_fix_flags(LPCWSTR cmd) {
-    if ((g_fix_mask & FIX_GPU) && !cmd_has_switch(cmd, FLAG_GPU)) return 0;
-    if ((g_fix_mask & FIX_DCOMP) && !cmd_has_switch(cmd, FLAG_DCOMP)) return 0;
+    if (cmd_has_switch(cmd, FLAG_GPU) != cmd_has_switch(g_launch_args, FLAG_GPU)) return 0;
+    if (cmd_has_switch(cmd, FLAG_DCOMP) != cmd_has_switch(g_launch_args, FLAG_DCOMP)) return 0;
     return 1;
 }
 
@@ -942,8 +954,9 @@ static void scan_claude_processes(void) {
     }
 }
 
-/* 1 = at least one main Claude process is running without the flag */
-static int any_main_without_flag(void) {
+/* 1 = at least one main Claude process runs with fix switches other than ours
+   (none at all after an auto-update, or those of a different mode) */
+static int any_main_needs_restart(void) {
     int i;
     for (i = 0; i < g_nprocs; i++) {
         if (g_procs[i].is_main && process_has_fix_flags(g_procs[i].pid) == 0) return 1;
@@ -1016,26 +1029,56 @@ static int launch_claude(void) {
 /* Guardian: keeps the flag on after Claude auto-updates and restarts itself  */
 /* ------------------------------------------------------------------------- */
 
+/* Only one guardian runs at a time, and the most recent launch wins: a running guardian
+   keeps the mode it was started with, so if it stayed in charge after the user switched
+   mode it would "fix" Claude back to the old mode. Ownership of GUARDIAN_MUTEX is the
+   guardian role; GUARDIAN_STOP asks the current owner to step down. */
+static HANDLE g_guard_mutex;
+static HANDLE g_stop_event;
+
+static int stop_requested(DWORD wait_ms) {
+    return g_stop_event && WaitForSingleObject(g_stop_event, wait_ms) == WAIT_OBJECT_0;
+}
+
+/* Returns 1 if this process now holds the guardian role */
+static int take_over_guardian(void) {
+    DWORD w;
+
+    g_stop_event = CreateEventW(NULL, TRUE, FALSE, GUARDIAN_STOP);
+    g_guard_mutex = CreateMutexW(NULL, FALSE, GUARDIAN_MUTEX);
+    if (!g_stop_event || !g_guard_mutex) return 0;
+
+    w = WaitForSingleObject(g_guard_mutex, 0);
+    if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+        /* Another Cloudy is guarding Claude: ask it to step down and take its place */
+        SetEvent(g_stop_event);
+        w = WaitForSingleObject(g_guard_mutex, GUARD_TAKEOVER_MS);
+    }
+    if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) return 0;
+    ResetEvent(g_stop_event);
+    return 1;
+}
+
+static void release_guardian(void) {
+    if (g_guard_mutex) {
+        ReleaseMutex(g_guard_mutex);
+        CloseHandle(g_guard_mutex);
+        g_guard_mutex = NULL;
+    }
+}
+
 static void run_guardian(void) {
-    HANDLE mutex;
     DWORD idle_ms = 0;
     int restarts = 0;
     int i, main_idx, flag;
 
-    mutex = CreateMutexW(NULL, FALSE, GUARDIAN_MUTEX);
-    if (!mutex) return;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        /* Another Cloudy is already guarding Claude */
-        CloseHandle(mutex);
-        return;
-    }
-
     for (;;) {
+        if (stop_requested(0)) break; /* a newer Cloudy launch took over */
         scan_claude_processes();
 
-        if (any_main_without_flag()) {
-            /* Claude was (re)started without the flag: typically the auto-updater
-               relaunching the new version. Relaunch it with the flag. */
+        if (any_main_needs_restart()) {
+            /* Claude was (re)started without our switches: typically the auto-updater
+               relaunching the new version. Relaunch it with them. */
             if (restarts >= GUARD_MAX_RESTARTS) {
                 static WCHAR msg[512];
                 wcopy(msg, 512, L"Claude Desktop continua a ripartire senza ");
@@ -1051,7 +1094,7 @@ static void run_guardian(void) {
             find_latest_claude(); /* the update moved Claude to a new versioned folder */
             if (!g_best.found || !launch_claude()) break;
             idle_ms = 0;
-            Sleep(GUARD_POLL_MS);
+            if (stop_requested(GUARD_POLL_MS)) break;
             continue;
         }
 
@@ -1070,9 +1113,15 @@ static void run_guardian(void) {
             if (flag == 1) restarts = 0;
             idle_ms = 0;
             if (h) {
-                /* Zero CPU while Claude runs: just wait for the main process to exit */
-                WaitForSingleObject(h, INFINITE);
+                /* Zero CPU while Claude runs: wait for the main process to exit
+                   (or for a newer Cloudy launch to take over) */
+                HANDLE waits[2];
+                DWORD w;
+                waits[0] = h;
+                waits[1] = g_stop_event;
+                w = WaitForMultipleObjects(g_stop_event ? 2 : 1, waits, FALSE, INFINITE);
                 CloseHandle(h);
+                if (w == WAIT_OBJECT_0 + 1) break;
                 continue;
             }
         } else if (idle_ms >= GUARD_GRACE_MS) {
@@ -1080,11 +1129,9 @@ static void run_guardian(void) {
             break;
         }
 
-        Sleep(GUARD_POLL_MS);
+        if (stop_requested(GUARD_POLL_MS)) break;
         idle_ms += GUARD_POLL_MS;
     }
-
-    CloseHandle(mutex);
 }
 
 static void show_status(void) {
@@ -1120,9 +1167,9 @@ static void show_status(void) {
             wcat(msg_buf, 4096, g_fix_flags);
             wcat(msg_buf, 4096, L")");
         } else if (flag == 0) {
-            wcat(msg_buf, 4096, L" (SENZA ");
+            wcat(msg_buf, 4096, L" (NON allineata: deve avere solo ");
             wcat(msg_buf, 4096, g_fix_flags);
-            wcat(msg_buf, 4096, L": avvia Cloudy per correggerla)");
+            wcat(msg_buf, 4096, L"; avvia Cloudy per correggerla)");
         } else {
             wcat(msg_buf, 4096, L" (flag non verificabili)");
         }
@@ -1147,7 +1194,7 @@ void __stdcall WinMainCRTStartup(void) {
     int opt_status = 0;
     int opt_restart = 0;
     int opt_no_watch = 0;
-    int cli_mask = 0, cfg_mask, i;
+    int cli_mask = 0, cfg_mask, i, is_guardian;
     LPCWSTR bad_cli_mode = NULL;
     static WCHAR bad_cfg_mode[64];
 
@@ -1218,11 +1265,15 @@ void __stdcall WinMainCRTStartup(void) {
         ExitProcess(0);
     }
 
+    /* Become the (only) guardian before touching Claude, so that a guardian started
+       earlier, possibly in another mode, cannot undo what this launch does. */
+    is_guardian = take_over_guardian();
+
     /* If Claude is already running without the flag (started by the auto-updater,
        by "launch at login", from the Start menu...), Electron's single-instance lock
        would just forward our launch to that flickering instance. Restart it instead. */
     scan_claude_processes();
-    if (g_nprocs > 0 && (opt_restart || any_main_without_flag())) {
+    if (g_nprocs > 0 && (opt_restart || any_main_needs_restart())) {
         kill_desktop_claude();
     }
 
@@ -1233,12 +1284,14 @@ void __stdcall WinMainCRTStartup(void) {
             L"Cloudy - Errore di avvio",
             MB_OK | MB_ICONERROR
         );
+        release_guardian();
         ExitProcess(1);
     }
 
-    if (!opt_no_watch) {
+    if (!opt_no_watch && is_guardian) {
         run_guardian();
     }
+    release_guardian();
     ExitProcess(0);
 }
 

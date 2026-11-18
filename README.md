@@ -73,7 +73,7 @@ mode=dcomp
 
 The mode can also be set on the command line, which overrides `Cloudy.ini`: `Cloudy.exe --mode=both`, or `Cloudy.exe --dcomp` as a shortcut for `--mode=dcomp`. An invalid value shows a warning and Cloudy keeps going with the previous mode.
 
-After changing the mode, launch Cloudy again: a running Claude that lacks the new switches is restarted with them. `Cloudy.exe --status` shows the active mode, where it came from, and the path of the `Cloudy.ini` file Cloudy reads.
+After changing the mode, launch Cloudy again: a running Claude whose switches differ from the new mode (missing ones, or extra ones left over from the previous mode) is restarted with exactly the new switches, and the new launch takes over from the Cloudy already waiting in the background, so the most recent launch always decides the mode. `Cloudy.exe --status` shows the active mode, where it came from, and the path of the `Cloudy.ini` file Cloudy reads.
 
 ---
 
