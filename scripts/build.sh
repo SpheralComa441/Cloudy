@@ -22,6 +22,22 @@ EXPORTS
     CreatePipe
     SetHandleInformation
     ReadFile
+    OpenProcess
+    TerminateProcess
+    QueryFullProcessImageNameW
+    CreateToolhelp32Snapshot
+    Process32FirstW
+    Process32NextW
+    CreateMutexW
+    OpenMutexW
+    GetLastError
+    GetTickCount
+EOF
+
+cat > build/ntdll.def << 'EOF'
+LIBRARY ntdll.dll
+EXPORTS
+    NtQueryInformationProcess
 EOF
 
 cat > build/advapi32.def << 'EOF'
@@ -46,7 +62,7 @@ EXPORTS
     CommandLineToArgvW
 EOF
 
-for dll in kernel32 advapi32 user32 shell32; do
+for dll in kernel32 advapi32 user32 shell32 ntdll; do
     llvm-dlltool -m i386:x86-64 -d "build/${dll}.def" -l "build/${dll}.lib"
 done
 
@@ -66,7 +82,8 @@ lld-link \
     build/kernel32.lib \
     build/advapi32.lib \
     build/user32.lib \
-    build/shell32.lib
+    build/shell32.lib \
+    build/ntdll.lib
 
 rm -rf build
 echo "Built Cloudy.exe ($(wc -c < Cloudy.exe) bytes)"
