@@ -6,10 +6,18 @@
  * and standard AppData installations) without requiring Administrator privileges,
  * and launches app\claude.exe with --disable-gpu-compositing.
  *
- * Zero dependencies, zero background processes, zero console window.
+ * After launching, Cloudy stays in the background as an idle "guardian" (it just
+ * waits on Claude's process handle, 0% CPU) until Claude is closed. If Claude
+ * restarts itself after an auto-update, the updater relaunches it WITHOUT
+ * --disable-gpu-compositing and the flicker comes back: the guardian notices the
+ * flag is missing and relaunches the new version with the flag.
+ * Use --no-watch to get the old "launch and exit immediately" behaviour.
+ *
+ * Zero dependencies, zero console window.
  */
 
 typedef unsigned short WCHAR;
+typedef unsigned short USHORT;
 typedef unsigned int DWORD;
 typedef int BOOL;
 typedef unsigned char BYTE;
@@ -33,6 +41,8 @@ typedef WCHAR *LPWSTR;
 #define HKEY_LOCAL_MACHINE ((HKEY)(ULONG_PTR)0x80000002ULL)
 #define KEY_READ           0x20019
 #define ERROR_SUCCESS      0L
+#define ERROR_ALREADY_EXISTS 183L
+#define ERROR_MORE_DATA    234L
 
 #define CREATE_NO_WINDOW   0x08000000
 #define STARTF_USESHOWWINDOW 0x00000001
@@ -41,9 +51,29 @@ typedef WCHAR *LPWSTR;
 #define SW_SHOWNORMAL      1
 #define HANDLE_FLAG_INHERIT 0x00000001
 
+#define INFINITE           0xFFFFFFFF
+#define WAIT_OBJECT_0      0x00000000
+#define WAIT_TIMEOUT       0x00000102
+
+#define PROCESS_TERMINATE                 0x00000001
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x00001000
+#define SYNCHRONIZE                       0x00100000
+#define TH32CS_SNAPPROCESS                0x00000002
+#define ProcessCommandLineInformation     60
+
 #define MB_OK              0x00000000
 #define MB_ICONERROR       0x00000010
+#define MB_ICONWARNING     0x00000030
 #define MB_ICONINFORMATION 0x00000040
+
+#define GPU_FLAG           L"--disable-gpu-compositing"
+#define GUARDIAN_MUTEX     L"Local\\Cloudy.Guardian"
+
+/* Guardian tuning */
+#define GUARD_POLL_MS      2000     /* poll interval while Claude is NOT running */
+#define GUARD_GRACE_MS     180000   /* after Claude exits, wait this long for an updater relaunch */
+#define GUARD_MAX_RESTARTS 3        /* consecutive fix attempts before giving up (avoid loops) */
+#define KILL_TIMEOUT_MS    5000
 
 typedef struct _FILETIME {
     DWORD dwLowDateTime;
@@ -97,6 +127,25 @@ typedef struct _PROCESS_INFORMATION {
     DWORD dwThreadId;
 } PROCESS_INFORMATION;
 
+typedef struct _PROCESSENTRY32W {
+    DWORD dwSize;
+    DWORD cntUsage;
+    DWORD th32ProcessID;
+    ULONG_PTR th32DefaultHeapID;
+    DWORD th32ModuleID;
+    DWORD cntThreads;
+    DWORD th32ParentProcessID;
+    long pcPriClassBase;
+    DWORD dwFlags;
+    WCHAR szExeFile[260];
+} PROCESSENTRY32W;
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    WCHAR *Buffer;
+} UNICODE_STRING;
+
 /* Win32 API imports */
 __declspec(dllimport) LPWSTR __stdcall GetCommandLineW(void);
 __declspec(dllimport) LPWSTR * __stdcall CommandLineToArgvW(LPCWSTR lpCmdLine, int *pNumArgs);
@@ -125,6 +174,18 @@ __declspec(dllimport) void __stdcall ExitProcess( unsigned int uExitCode);
 __declspec(dllimport) BOOL __stdcall CreatePipe(HANDLE *hReadPipe, HANDLE *hWritePipe, SECURITY_ATTRIBUTES *lpPipeAttributes, DWORD nSize);
 __declspec(dllimport) BOOL __stdcall SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags);
 __declspec(dllimport) BOOL __stdcall ReadFile(HANDLE hFile, void *lpBuffer, DWORD nNumberOfBytesToRead, DWORD *lpNumberOfBytesRead, void *lpOverlapped);
+__declspec(dllimport) HANDLE __stdcall OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+__declspec(dllimport) BOOL __stdcall TerminateProcess(HANDLE hProcess, unsigned int uExitCode);
+__declspec(dllimport) BOOL __stdcall QueryFullProcessImageNameW(HANDLE hProcess, DWORD dwFlags, LPWSTR lpExeName, DWORD *lpdwSize);
+__declspec(dllimport) HANDLE __stdcall CreateToolhelp32Snapshot(DWORD dwFlags, DWORD th32ProcessID);
+__declspec(dllimport) BOOL __stdcall Process32FirstW(HANDLE hSnapshot, PROCESSENTRY32W *lppe);
+__declspec(dllimport) BOOL __stdcall Process32NextW(HANDLE hSnapshot, PROCESSENTRY32W *lppe);
+__declspec(dllimport) HANDLE __stdcall CreateMutexW(SECURITY_ATTRIBUTES *lpMutexAttributes, BOOL bInitialOwner, LPCWSTR lpName);
+__declspec(dllimport) HANDLE __stdcall OpenMutexW(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName);
+__declspec(dllimport) DWORD __stdcall GetLastError(void);
+__declspec(dllimport) DWORD __stdcall GetTickCount(void);
+
+__declspec(dllimport) long __stdcall NtQueryInformationProcess(HANDLE ProcessHandle, int ProcessInformationClass, void *ProcessInformation, unsigned long ProcessInformationLength, unsigned long *ReturnLength);
 
 __declspec(dllimport) long __stdcall RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, DWORD samDesired, HKEY *phkResult);
 __declspec(dllimport) long __stdcall RegEnumKeyExW(HKEY hKey, DWORD dwIndex, LPWSTR lpName, DWORD *lpcchName, DWORD *lpReserved, LPWSTR lpClass, DWORD *lpcchClass, FILETIME *lpftLastWriteTime);
@@ -216,6 +277,35 @@ static int wcontains_i(LPCWSTR hay, LPCWSTR needle) {
     return 0;
 }
 
+/* Append one argument to a command line, quoted with the rules used by
+   CommandLineToArgvW / the MSVC runtime (which Chromium/Electron also use).
+   The argument is skipped entirely if it does not fit, instead of being
+   truncated into an unbalanced quote. */
+static void append_quoted_arg(LPWSTR dst, int cap, LPCWSTR arg) {
+    int len = wlen(dst);
+    int alen = wlen(arg);
+    int i, n, bs = 0;
+
+    if (len + 2 * alen + 3 >= cap) return;
+
+    dst[len++] = L' ';
+    dst[len++] = L'"';
+    for (i = 0; i < alen; i++) {
+        if (arg[i] == L'\\') {
+            bs++;
+            continue;
+        }
+        /* Backslashes are only special when followed by a quote */
+        for (n = 0; n < (arg[i] == L'"' ? bs * 2 + 1 : bs); n++) dst[len++] = L'\\';
+        dst[len++] = arg[i];
+        bs = 0;
+    }
+    /* Trailing backslashes precede the closing quote: double them */
+    for (n = 0; n < bs * 2; n++) dst[len++] = L'\\';
+    dst[len++] = L'"';
+    dst[len] = 0;
+}
+
 static int file_exists(LPCWSTR path) {
     DWORD attr;
     if (!path || !path[0]) return 0;
@@ -280,6 +370,9 @@ typedef struct {
 } Candidate;
 
 static Candidate g_best;
+
+/* "--disable-gpu-compositing" + forwarded user arguments (already quoted) */
+static WCHAR g_launch_args[2048];
 
 static void uint_to_wstr(unsigned int v, LPWSTR out, int cap) {
     WCHAR tmp[16];
@@ -388,6 +481,7 @@ static void scan_registry_packages(HKEY root_key, LPCWSTR reg_path) {
         DWORD name_len = 512;
         FILETIME ft;
         long res = RegEnumKeyExW(hKey, idx, subkey_name, &name_len, NULL, NULL, NULL, &ft);
+        if (res == ERROR_MORE_DATA) continue; /* name too long for our buffer: skip it, keep enumerating */
         if (res != ERROR_SUCCESS) break;
 
         if (is_claude_package_name(subkey_name)) {
@@ -469,6 +563,14 @@ static void scan_via_powershell_fallback(void) {
         CloseHandle(hWrite);
         hWrite = NULL;
 
+        /* Never block forever on a stuck PowerShell: once it has exited (or been
+           killed) every write end of the pipe is closed and ReadFile cannot hang.
+           The output is a single short line, far below the pipe buffer size. */
+        if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT) {
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 2000);
+        }
+
         while (total_read < sizeof(out_buf) - 1 &&
                ReadFile(hRead, out_buf + total_read, (DWORD)(sizeof(out_buf) - 1 - total_read), &bytes_read, NULL) &&
                bytes_read > 0) {
@@ -476,7 +578,6 @@ static void scan_via_powershell_fallback(void) {
         }
         out_buf[total_read] = 0;
 
-        WaitForSingleObject(pi.hProcess, 3000);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
@@ -551,24 +652,312 @@ static void find_latest_claude(void) {
     }
 }
 
-static void kill_existing_claude(void) {
+/* ------------------------------------------------------------------------- */
+/* Running Claude Desktop processes                                          */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    DWORD pid;
+    DWORD ppid;
+    int is_main; /* 1 = Electron main/browser process (its parent is not another Claude Desktop process) */
+} ClaudeProc;
+
+#define MAX_CLAUDE_PROCS 256
+static ClaudeProc g_procs[MAX_CLAUDE_PROCS];
+static int g_nprocs;
+
+/* Only Claude *Desktop* binaries. The Claude Code CLI is also called claude.exe
+   (e.g. %USERPROFILE%\.local\bin\claude.exe) and must never be killed by us. */
+static int is_desktop_claude_image(LPCWSTR path) {
+    int n;
+    if (!path || !path[0]) return 0;
+    if (wcontains_i(path, L"\\WindowsApps\\") &&
+        (wcontains_i(path, L"\\Claude_") || wcontains_i(path, L"\\Anthropic.Claude_") || wcontains_i(path, L"pzs8sxrjxfjjc"))) {
+        return 1;
+    }
+    if (wcontains_i(path, L"\\AnthropicClaude\\")) return 1;
+    if (wcontains_i(path, L"\\Programs\\Claude\\claude.exe")) return 1;
+    if (g_best.found) {
+        n = wlen(g_best.app_dir);
+        if (n > 0 && wstarts_with_i(path, g_best.app_dir) && path[n] == L'\\') return 1;
+    }
+    return 0;
+}
+
+static int handle_is_desktop_claude(HANDLE h) {
+    static WCHAR image[1024];
+    DWORD size = 1024;
+    if (!QueryFullProcessImageNameW(h, 0, image, &size)) return 0;
+    return is_desktop_claude_image(image);
+}
+
+/* Returns the command line of a process (static buffer, overwritten by the next call), or NULL */
+static WCHAR *read_command_line(DWORD pid) {
+    /* UNICODE_STRING header followed by the string itself (max 32767 chars) */
+    static unsigned long long buf[(65536 + 64) / 8];
+    unsigned long ret_len = 0;
+    UNICODE_STRING *us = (UNICODE_STRING *)buf;
+    BYTE *buf_end = (BYTE *)buf + sizeof(buf);
+    WCHAR *end;
+    HANDLE h;
+    long status;
+
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return NULL;
+
+    /* Windows 8.1+. Leave room for a terminating NUL. */
+    us->Buffer = NULL;
+    status = NtQueryInformationProcess(h, ProcessCommandLineInformation, buf, (unsigned long)(sizeof(buf) - sizeof(WCHAR)), &ret_len);
+    CloseHandle(h);
+    if (status < 0 || !us->Buffer) return NULL;
+
+    end = us->Buffer + us->Length / sizeof(WCHAR);
+    if ((BYTE *)us->Buffer < (BYTE *)buf || (BYTE *)end + sizeof(WCHAR) > buf_end) return NULL;
+    *end = 0;
+    return us->Buffer;
+}
+
+/* 1 = command line contains --disable-gpu-compositing, 0 = it does not, -1 = unknown */
+static int process_has_gpu_flag(DWORD pid) {
+    WCHAR *cmd = read_command_line(pid);
+    if (!cmd) return -1;
+    return wcontains_i(cmd, GPU_FLAG) ? 1 : 0;
+}
+
+static void scan_claude_processes(void) {
+    static PROCESSENTRY32W pe;
+    HANDLE snap;
+    WCHAR *cmd;
+    int i, j;
+
+    g_nprocs = 0;
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    memset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (g_nprocs < MAX_CLAUDE_PROCS && weq_i(pe.szExeFile, L"claude.exe")) {
+                HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                if (h) {
+                    /* Skip processes that already exited (zombies still referenced by a handle) */
+                    if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT && handle_is_desktop_claude(h)) {
+                        g_procs[g_nprocs].pid = pe.th32ProcessID;
+                        g_procs[g_nprocs].ppid = pe.th32ParentProcessID;
+                        g_procs[g_nprocs].is_main = 1;
+                        g_nprocs++;
+                    }
+                    CloseHandle(h);
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+
+    /* Renderer/GPU/utility/crashpad helpers are children of the main process */
+    for (i = 0; i < g_nprocs; i++) {
+        for (j = 0; j < g_nprocs; j++) {
+            if (i != j && g_procs[i].ppid == g_procs[j].pid) {
+                g_procs[i].is_main = 0;
+                break;
+            }
+        }
+    }
+
+    /* A helper can outlive its main process (e.g. crashpad-handler): Chromium marks
+       every helper with --type=..., the main process never has it. */
+    for (i = 0; i < g_nprocs; i++) {
+        if (!g_procs[i].is_main) continue;
+        cmd = read_command_line(g_procs[i].pid);
+        if (cmd && wcontains_i(cmd, L"--type=")) g_procs[i].is_main = 0;
+    }
+}
+
+/* 1 = at least one main Claude process is running without the flag */
+static int any_main_without_flag(void) {
+    int i;
+    for (i = 0; i < g_nprocs; i++) {
+        if (g_procs[i].is_main && process_has_gpu_flag(g_procs[i].pid) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Terminate every Claude Desktop process (main first, then helpers) and wait for them to exit,
+   so that Electron's single-instance lock is released before we relaunch. */
+static void kill_desktop_claude(void) {
+    static HANDLE handles[MAX_CLAUDE_PROCS];
+    int i, pass, n = 0;
+    DWORD start, elapsed;
+
+    scan_claude_processes();
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < g_nprocs; i++) {
+            HANDLE h;
+            if ((pass == 0) != (g_procs[i].is_main != 0)) continue;
+            h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_procs[i].pid);
+            if (!h) continue;
+            /* Re-check the image in case the PID was recycled since the snapshot */
+            if (!handle_is_desktop_claude(h)) {
+                CloseHandle(h);
+                continue;
+            }
+            TerminateProcess(h, 1);
+            handles[n++] = h;
+        }
+    }
+
+    start = GetTickCount();
+    for (i = 0; i < n; i++) {
+        elapsed = GetTickCount() - start;
+        WaitForSingleObject(handles[i], elapsed < KILL_TIMEOUT_MS ? KILL_TIMEOUT_MS - elapsed : 0);
+        CloseHandle(handles[i]);
+    }
+    if (n > 0) Sleep(300);
+}
+
+static int launch_claude(void) {
+    static WCHAR cmd_line[4096];
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    static WCHAR kill_cmd[128];
 
+    /* Attempt 1: direct CreateProcessW (no cmd.exe in between, so no cmd quoting/metacharacter issues) */
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
     memset(&pi, 0, sizeof(pi));
 
-    wcopy(kill_cmd, 128, L"taskkill.exe /F /IM claude.exe");
-    if (CreateProcessW(NULL, kill_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 3000);
+    wcopy(cmd_line, 4096, L"\"");
+    wcat(cmd_line, 4096, g_best.exe_path);
+    wcat(cmd_line, 4096, L"\" ");
+    wcat(cmd_line, 4096, g_launch_args);
+
+    if (CreateProcessW(g_best.exe_path, cmd_line, NULL, NULL, FALSE, 0, NULL, g_best.app_dir, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        Sleep(350);
+        return 1;
     }
+
+    /* Attempt 2: ShellExecuteW (same mechanism used by `cmd /c start`) */
+    if ((ULONG_PTR)ShellExecuteW(NULL, L"open", g_best.exe_path, g_launch_args, g_best.app_dir, SW_SHOWNORMAL) > 32) {
+        return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Guardian: keeps the flag on after Claude auto-updates and restarts itself  */
+/* ------------------------------------------------------------------------- */
+
+static void run_guardian(void) {
+    HANDLE mutex;
+    DWORD idle_ms = 0;
+    int restarts = 0;
+    int i, main_idx, flag;
+
+    mutex = CreateMutexW(NULL, FALSE, GUARDIAN_MUTEX);
+    if (!mutex) return;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        /* Another Cloudy is already guarding Claude */
+        CloseHandle(mutex);
+        return;
+    }
+
+    for (;;) {
+        scan_claude_processes();
+
+        if (any_main_without_flag()) {
+            /* Claude was (re)started without the flag: typically the auto-updater
+               relaunching the new version. Relaunch it with the flag. */
+            if (restarts >= GUARD_MAX_RESTARTS) {
+                MessageBoxW(
+                    NULL,
+                    L"Claude Desktop continua a ripartire senza --disable-gpu-compositing.\n\n"
+                    L"Cloudy ha smesso di riavviarlo automaticamente per evitare un ciclo.\n"
+                    L"Chiudi Claude e riaprilo con Cloudy (oppure usa Cloudy.exe --restart).",
+                    L"Cloudy - Guardiano",
+                    MB_OK | MB_ICONWARNING
+                );
+                break;
+            }
+            restarts++;
+            kill_desktop_claude();
+            find_latest_claude(); /* the update moved Claude to a new versioned folder */
+            if (!g_best.found || !launch_claude()) break;
+            idle_ms = 0;
+            Sleep(GUARD_POLL_MS);
+            continue;
+        }
+
+        main_idx = -1;
+        flag = -1;
+        for (i = 0; i < g_nprocs; i++) {
+            if (g_procs[i].is_main) {
+                main_idx = i;
+                flag = process_has_gpu_flag(g_procs[i].pid);
+                break;
+            }
+        }
+
+        if (main_idx >= 0) {
+            HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, g_procs[main_idx].pid);
+            if (flag == 1) restarts = 0;
+            idle_ms = 0;
+            if (h) {
+                /* Zero CPU while Claude runs: just wait for the main process to exit */
+                WaitForSingleObject(h, INFINITE);
+                CloseHandle(h);
+                continue;
+            }
+        } else if (idle_ms >= GUARD_GRACE_MS) {
+            /* Claude was closed and nobody relaunched it: we're done */
+            break;
+        }
+
+        Sleep(GUARD_POLL_MS);
+        idle_ms += GUARD_POLL_MS;
+    }
+
+    CloseHandle(mutex);
+}
+
+static void show_status(void) {
+    static WCHAR msg_buf[4096];
+    static WCHAR num[16];
+    HANDLE mutex;
+    int i, shown = 0, flag;
+
+    wcopy(msg_buf, 4096, L"Claude Desktop rilevato correttamente!\n\nVersione rilevata: ");
+    wcat(msg_buf, 4096, g_best.version_str);
+    wcat(msg_buf, 4096, L"\n\nPercorso eseguibile:\n");
+    wcat(msg_buf, 4096, g_best.exe_path);
+    wcat(msg_buf, 4096, L"\n\nArgomenti di avvio:\n");
+    wcat(msg_buf, 4096, g_launch_args);
+
+    wcat(msg_buf, 4096, L"\n\nIstanza in esecuzione: ");
+    scan_claude_processes();
+    for (i = 0; i < g_nprocs; i++) {
+        if (!g_procs[i].is_main) continue;
+        if (shown++) wcat(msg_buf, 4096, L", ");
+        wcat(msg_buf, 4096, L"PID ");
+        uint_to_wstr(g_procs[i].pid, num, 16);
+        wcat(msg_buf, 4096, num);
+        flag = process_has_gpu_flag(g_procs[i].pid);
+        if (flag == 1) wcat(msg_buf, 4096, L" (con --disable-gpu-compositing)");
+        else if (flag == 0) wcat(msg_buf, 4096, L" (SENZA --disable-gpu-compositing: avvia Cloudy per correggerla)");
+        else wcat(msg_buf, 4096, L" (flag non verificabile)");
+    }
+    if (!shown) wcat(msg_buf, 4096, L"nessuna");
+
+    wcat(msg_buf, 4096, L"\nGuardiano aggiornamenti: ");
+    mutex = OpenMutexW(SYNCHRONIZE, FALSE, GUARDIAN_MUTEX);
+    if (mutex) {
+        wcat(msg_buf, 4096, L"attivo");
+        CloseHandle(mutex);
+    } else {
+        wcat(msg_buf, 4096, L"non attivo");
+    }
+
+    MessageBoxW(NULL, msg_buf, L"Cloudy - Stato Launcher", MB_OK | MB_ICONINFORMATION);
 }
 
 void __stdcall WinMainCRTStartup(void) {
@@ -576,23 +965,20 @@ void __stdcall WinMainCRTStartup(void) {
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     int opt_status = 0;
     int opt_restart = 0;
-    static WCHAR extra_args[1024];
-    static WCHAR cmd_line[2048];
-    static WCHAR shell_args[1200];
-    static WCHAR msg_buf[2048];
+    int opt_no_watch = 0;
     int i;
 
-    extra_args[0] = 0;
+    wcopy(g_launch_args, 2048, GPU_FLAG);
     if (argv) {
         for (i = 1; i < argc; i++) {
             if (weq_i(argv[i], L"--status") || weq_i(argv[i], L"/status")) {
                 opt_status = 1;
             } else if (weq_i(argv[i], L"--restart") || weq_i(argv[i], L"/restart")) {
                 opt_restart = 1;
-            } else if (!weq_i(argv[i], L"--disable-gpu-compositing")) {
-                wcat(extra_args, 1024, L" \"");
-                wcat(extra_args, 1024, argv[i]);
-                wcat(extra_args, 1024, L"\"");
+            } else if (weq_i(argv[i], L"--no-watch") || weq_i(argv[i], L"/nowatch")) {
+                opt_no_watch = 1;
+            } else if (!weq_i(argv[i], GPU_FLAG)) {
+                append_quoted_arg(g_launch_args, 2048, argv[i]);
             }
         }
         LocalFree((HANDLE)argv);
@@ -615,81 +1001,33 @@ void __stdcall WinMainCRTStartup(void) {
     }
 
     if (opt_status) {
-        wcopy(msg_buf, 2048, L"Claude Desktop rilevato correttamente!\n\nVersione rilevata: ");
-        wcat(msg_buf, 2048, g_best.version_str);
-        wcat(msg_buf, 2048, L"\n\nPercorso eseguibile:\n");
-        wcat(msg_buf, 2048, g_best.exe_path);
-        wcat(msg_buf, 2048, L"\n\nArgomenti di avvio:\n--disable-gpu-compositing");
-        wcat(msg_buf, 2048, extra_args);
-        MessageBoxW(NULL, msg_buf, L"Cloudy - Stato Launcher", MB_OK | MB_ICONINFORMATION);
+        show_status();
         ExitProcess(0);
     }
 
-    if (opt_restart) {
-        kill_existing_claude();
+    /* If Claude is already running without the flag (started by the auto-updater,
+       by "launch at login", from the Start menu...), Electron's single-instance lock
+       would just forward our launch to that flickering instance. Restart it instead. */
+    scan_claude_processes();
+    if (g_nprocs > 0 && (opt_restart || any_main_without_flag())) {
+        kill_desktop_claude();
     }
 
-    /* Build launch arguments */
-    wcopy(shell_args, 1200, L"--disable-gpu-compositing");
-    wcat(shell_args, 1200, extra_args);
-
-    /* Attempt 1: Hidden cmd.exe /c start "" "<exe>" --disable-gpu-compositing
-       (Exact equivalent of the working G-Sync fix command, with CREATE_NO_WINDOW so no CMD window flashes) */
-    {
-        STARTUPINFOW si;
-        PROCESS_INFORMATION pi;
-        memset(&si, 0, sizeof(si));
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        memset(&pi, 0, sizeof(pi));
-
-        wcopy(cmd_line, 2048, L"cmd.exe /c start \"\" \"");
-        wcat(cmd_line, 2048, g_best.exe_path);
-        wcat(cmd_line, 2048, L"\" ");
-        wcat(cmd_line, 2048, shell_args);
-
-        if (CreateProcessW(NULL, cmd_line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, g_best.app_dir, &si, &pi)) {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            ExitProcess(0);
-        }
+    if (!launch_claude()) {
+        MessageBoxW(
+            NULL,
+            L"Impossibile avviare Claude Desktop.\nVerifica i permessi dell'applicazione.",
+            L"Cloudy - Errore di avvio",
+            MB_OK | MB_ICONERROR
+        );
+        ExitProcess(1);
     }
 
-    /* Attempt 2: Direct CreateProcessW on app\claude.exe */
-    {
-        STARTUPINFOW si;
-        PROCESS_INFORMATION pi;
-        memset(&si, 0, sizeof(si));
-        si.cb = sizeof(si);
-        memset(&pi, 0, sizeof(pi));
-
-        wcopy(cmd_line, 2048, L"\"");
-        wcat(cmd_line, 2048, g_best.exe_path);
-        wcat(cmd_line, 2048, L"\" ");
-        wcat(cmd_line, 2048, shell_args);
-
-        if (CreateProcessW(g_best.exe_path, cmd_line, NULL, NULL, FALSE, 0, NULL, g_best.app_dir, &si, &pi)) {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            ExitProcess(0);
-        }
+    if (!opt_no_watch) {
+        run_guardian();
     }
-
-    /* Attempt 3: ShellExecuteW fallback */
-    if ((ULONG_PTR)ShellExecuteW(NULL, L"open", g_best.exe_path, shell_args, g_best.app_dir, SW_SHOWNORMAL) > 32) {
-        ExitProcess(0);
-    }
-
-    MessageBoxW(
-        NULL,
-        L"Impossibile avviare Claude Desktop.\nVerifica i permessi dell'applicazione.",
-        L"Cloudy - Errore di avvio",
-        MB_OK | MB_ICONERROR
-    );
-    ExitProcess(1);
+    ExitProcess(0);
 }
 
 /* Ensure a non-empty .reloc section is emitted for Windows 10/11 ASLR compatibility */
 void * volatile g_aslr_anchor = (void *)&WinMainCRTStartup;
-
