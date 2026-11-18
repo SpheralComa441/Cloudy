@@ -83,9 +83,11 @@ jobs:
               --title "Cloudy ${TAG} — Claude Desktop G-Sync Flicker Fix Launcher" \
               --notes "### Cloudy ${TAG}
 
-          Ultra-lightweight native Windows x64 launcher that automatically locates the latest installed version of **Claude Desktop** (\`WindowsApps\` MSIX or \`AppData\`) without requiring Administrator privileges and launches it with \`--disable-gpu-compositing\` to eliminate G-Sync / FreeSync flickering.
+          Ultra-lightweight native Windows x64 launcher that locates the latest installed version of **Claude Desktop** (\`WindowsApps\` MSIX or \`AppData\`) without requiring Administrator privileges and launches it with Chromium switches that work around the flickering many users see on G-Sync / FreeSync / VRR monitors: \`--disable-gpu-compositing\` (default), \`--disable-direct-composition\` (\`mode=dcomp\`) or both (\`mode=both\`), selectable in \`Cloudy.ini\` or with \`--mode=\`.
 
-          After launching, Cloudy waits in the background (0% CPU) and, if Claude auto-updates and restarts without the flag, relaunches it with \`--disable-gpu-compositing\`. Use \`Cloudy.exe --no-watch\` to exit right after launch.
+          It is a workaround, not a guaranteed fix: flickering has more than one cause. See the README to check whether Cloudy fits your setup.
+
+          After launching, Cloudy waits in the background (0% CPU) and, if Claude auto-updates and restarts without the switches, relaunches it with them. Use \`Cloudy.exe --no-watch\` to exit right after launch.
 
           #### Assets
           - **\`Cloudy.exe\`** — Standalone native Windows executable built from source by this workflow (0 dependencies, no console window flash).
