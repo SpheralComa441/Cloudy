@@ -1,16 +1,21 @@
 /*
- * Cloudy - Ultra-lightweight launcher for Claude Desktop on Windows (G-Sync flicker fix)
+ * Cloudy - Ultra-lightweight launcher for Claude Desktop on Windows (flicker workaround)
  *
  * Automatically finds the latest installed version of Claude Desktop
  * (both MSIX/WindowsApps packages like Claude_1.10628.2.0_x64__pzs8sxrjxfjjc
  * and standard AppData installations) without requiring Administrator privileges,
- * and launches app\claude.exe with --disable-gpu-compositing.
+ * and launches app\claude.exe with the Chromium switch(es) of the selected mode:
+ *   gpu   (default)  --disable-gpu-compositing
+ *   dcomp            --disable-direct-composition   (needed on some RTX 50 series)
+ *   both             both switches
+ * The mode comes from --mode=<gpu|dcomp|both> / --dcomp, or from "mode=" in a
+ * Cloudy.ini file next to Cloudy.exe.
  *
  * After launching, Cloudy stays in the background as an idle "guardian" (it just
  * waits on Claude's process handle, 0% CPU) until Claude is closed. If Claude
- * restarts itself after an auto-update, the updater relaunches it WITHOUT
- * --disable-gpu-compositing and the flicker comes back: the guardian notices the
- * flag is missing and relaunches the new version with the flag.
+ * restarts itself after an auto-update, the updater relaunches it WITHOUT the
+ * switches and the flicker comes back: the guardian notices they are missing and
+ * relaunches the new version with them.
  * Use --no-watch to get the old "launch and exit immediately" behaviour.
  *
  * Zero dependencies, zero console window.
@@ -66,7 +71,19 @@ typedef WCHAR *LPWSTR;
 #define MB_ICONWARNING     0x00000030
 #define MB_ICONINFORMATION 0x00000040
 
-#define GPU_FLAG           L"--disable-gpu-compositing"
+#define GENERIC_READ       0x80000000
+#define FILE_SHARE_READ    0x00000001
+#define FILE_SHARE_WRITE   0x00000002
+#define OPEN_EXISTING      3
+#define FILE_ATTRIBUTE_NORMAL 0x00000080
+
+/* Fix modes: which Chromium switches Claude is launched with */
+#define FIX_GPU            1
+#define FIX_DCOMP          2
+#define FLAG_GPU           L"--disable-gpu-compositing"
+#define FLAG_DCOMP         L"--disable-direct-composition"
+#define CONFIG_NAME        L"Cloudy.ini"
+
 #define GUARDIAN_MUTEX     L"Local\\Cloudy.Guardian"
 
 /* Guardian tuning */
@@ -184,6 +201,8 @@ __declspec(dllimport) HANDLE __stdcall CreateMutexW(SECURITY_ATTRIBUTES *lpMutex
 __declspec(dllimport) HANDLE __stdcall OpenMutexW(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName);
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
 __declspec(dllimport) DWORD __stdcall GetTickCount(void);
+__declspec(dllimport) DWORD __stdcall GetModuleFileNameW(HINSTANCE hModule, LPWSTR lpFilename, DWORD nSize);
+__declspec(dllimport) HANDLE __stdcall CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, SECURITY_ATTRIBUTES *lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
 
 __declspec(dllimport) long __stdcall NtQueryInformationProcess(HANDLE ProcessHandle, int ProcessInformationClass, void *ProcessInformation, unsigned long ProcessInformationLength, unsigned long *ReturnLength);
 
@@ -371,8 +390,157 @@ typedef struct {
 
 static Candidate g_best;
 
-/* "--disable-gpu-compositing" + forwarded user arguments (already quoted) */
+/* Fix switches of the selected mode + forwarded user arguments (already quoted) */
 static WCHAR g_launch_args[2048];
+
+/* ------------------------------------------------------------------------- */
+/* Fix mode: --mode= / --dcomp on the command line, or mode= in Cloudy.ini   */
+/* ------------------------------------------------------------------------- */
+
+static int g_fix_mask = FIX_GPU;
+static WCHAR g_fix_flags[128];      /* switches of g_fix_mask, space separated */
+static LPCWSTR g_fix_source = L"predefinita";
+static WCHAR g_config_path[1024];
+
+static int parse_mode(LPCWSTR v) {
+    if (weq_i(v, L"gpu")) return FIX_GPU;
+    if (weq_i(v, L"dcomp")) return FIX_DCOMP;
+    if (weq_i(v, L"both")) return FIX_GPU | FIX_DCOMP;
+    return 0;
+}
+
+static LPCWSTR mode_name(int mask) {
+    if (mask == FIX_DCOMP) return L"dcomp";
+    if (mask == (FIX_GPU | FIX_DCOMP)) return L"both";
+    return L"gpu";
+}
+
+static void build_fix_flags(void) {
+    g_fix_flags[0] = 0;
+    if (g_fix_mask & FIX_GPU) wcat(g_fix_flags, 128, FLAG_GPU);
+    if (g_fix_mask & FIX_DCOMP) {
+        if (g_fix_flags[0]) wcat(g_fix_flags, 128, L" ");
+        wcat(g_fix_flags, 128, FLAG_DCOMP);
+    }
+}
+
+/* Is `sw` present in `cmd` as a whole switch? --disable-direct-composition must not
+   match --disable-direct-composition-video-overlays, for example. */
+static int cmd_has_switch(LPCWSTR cmd, LPCWSTR sw) {
+    int i, j, n = wlen(sw);
+    WCHAR next;
+    if (!cmd || n == 0) return 0;
+    for (i = 0; cmd[i]; i++) {
+        if (i > 0 && cmd[i - 1] != L' ' && cmd[i - 1] != L'\t' && cmd[i - 1] != L'"') continue;
+        for (j = 0; j < n; j++) {
+            if (!cmd[i + j] || wlower(cmd[i + j]) != wlower(sw[j])) break;
+        }
+        if (j < n) continue;
+        next = cmd[i + n];
+        if (next == 0 || next == L' ' || next == L'\t' || next == L'"' || next == L'=') return 1;
+    }
+    return 0;
+}
+
+static int cmd_has_fix_flags(LPCWSTR cmd) {
+    if ((g_fix_mask & FIX_GPU) && !cmd_has_switch(cmd, FLAG_GPU)) return 0;
+    if ((g_fix_mask & FIX_DCOMP) && !cmd_has_switch(cmd, FLAG_DCOMP)) return 0;
+    return 1;
+}
+
+static int is_space(WCHAR c) {
+    return c == L' ' || c == L'\t' || c == L'\r';
+}
+
+/* Reads "mode=<gpu|dcomp|both>" from Cloudy.ini next to Cloudy.exe.
+   Lines starting with ';' or '#' and [sections] are ignored; keys are case-insensitive.
+   Returns the mode mask, 0 if the file or the key is missing, -1 if the value is invalid
+   (the bad value is copied to bad_value). */
+static int read_config_mode(LPWSTR bad_value, int bad_cap) {
+    static BYTE raw[4096];
+    static WCHAR text[4096];
+    HANDLE h;
+    DWORD n = 0, m;
+    int i, len = 0, pos = 0, result = 0;
+
+    m = GetModuleFileNameW(NULL, g_config_path, 1024);
+    if (m == 0 || m >= 1024) {
+        g_config_path[0] = 0;
+        return 0;
+    }
+    for (i = (int)m; i > 0 && g_config_path[i - 1] != L'\\' && g_config_path[i - 1] != L'/'; i--) {
+    }
+    g_config_path[i] = 0;
+    wcat(g_config_path, 1024, CONFIG_NAME);
+
+    h = CreateFileW(g_config_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!ReadFile(h, raw, sizeof(raw), &n, NULL)) n = 0;
+    CloseHandle(h);
+
+    /* Notepad may save UTF-16 LE ("Unicode") or UTF-8 with/without BOM; only ASCII matters */
+    if (n >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
+        for (i = 2; i + 1 < (int)n && len < 4095; i += 2) text[len++] = (WCHAR)(raw[i] | (raw[i + 1] << 8));
+    } else {
+        i = (n >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) ? 3 : 0;
+        for (; i < (int)n && len < 4095; i++) text[len++] = (WCHAR)raw[i];
+    }
+    text[len] = 0;
+
+    while (pos < len) {
+        int line_end = pos, k0, k1, v0, v1, eq = -1;
+        while (line_end < len && text[line_end] != L'\n') line_end++;
+
+        k0 = pos;
+        while (k0 < line_end && is_space(text[k0])) k0++;
+        if (k0 < line_end && text[k0] != L';' && text[k0] != L'#' && text[k0] != L'[') {
+            for (i = k0; i < line_end; i++) {
+                if (text[i] == L'=') {
+                    eq = i;
+                    break;
+                }
+            }
+        }
+        if (eq > k0) {
+            k1 = eq;
+            while (k1 > k0 && is_space(text[k1 - 1])) k1--;
+            v0 = eq + 1;
+            while (v0 < line_end && is_space(text[v0])) v0++;
+            v1 = v0;
+            while (v1 < line_end && text[v1] != L';' && text[v1] != L'#') v1++; /* inline comment */
+            while (v1 > v0 && is_space(text[v1 - 1])) v1--;
+
+            if (k1 - k0 == 4 && wstarts_with_i(text + k0, L"mode")) {
+                WCHAR saved = text[v1];
+                text[v1] = 0;
+                result = parse_mode(text + v0);
+                if (!result) {
+                    wcopy(bad_value, bad_cap, text + v0);
+                    result = -1;
+                }
+                text[v1] = saved;
+            }
+        }
+        pos = line_end + 1;
+    }
+    return result;
+}
+
+static void warn_invalid_mode(LPCWSTR where, LPCWSTR value) {
+    static WCHAR msg[1024];
+    wcopy(msg, 1024, L"Modalità non valida in ");
+    wcat(msg, 1024, where);
+    wcat(msg, 1024, L": \"");
+    wcat(msg, 1024, value);
+    wcat(msg, 1024, L"\"\n\nValori ammessi:\n"
+                    L"• gpu = --disable-gpu-compositing (predefinita)\n"
+                    L"• dcomp = --disable-direct-composition\n"
+                    L"• both = entrambi\n\n"
+                    L"Cloudy prosegue con la modalità ");
+    wcat(msg, 1024, mode_name(g_fix_mask));
+    wcat(msg, 1024, L".");
+    MessageBoxW(NULL, msg, L"Cloudy - Configurazione", MB_OK | MB_ICONWARNING);
+}
 
 static void uint_to_wstr(unsigned int v, LPWSTR out, int cap) {
     WCHAR tmp[16];
@@ -717,11 +885,11 @@ static WCHAR *read_command_line(DWORD pid) {
     return us->Buffer;
 }
 
-/* 1 = command line contains --disable-gpu-compositing, 0 = it does not, -1 = unknown */
-static int process_has_gpu_flag(DWORD pid) {
+/* 1 = command line has every switch of the current mode, 0 = it does not, -1 = unknown */
+static int process_has_fix_flags(DWORD pid) {
     WCHAR *cmd = read_command_line(pid);
     if (!cmd) return -1;
-    return wcontains_i(cmd, GPU_FLAG) ? 1 : 0;
+    return cmd_has_fix_flags(cmd);
 }
 
 static void scan_claude_processes(void) {
@@ -770,7 +938,7 @@ static void scan_claude_processes(void) {
     for (i = 0; i < g_nprocs; i++) {
         if (!g_procs[i].is_main) continue;
         cmd = read_command_line(g_procs[i].pid);
-        if (cmd && wcontains_i(cmd, L"--type=")) g_procs[i].is_main = 0;
+        if (cmd && cmd_has_switch(cmd, L"--type")) g_procs[i].is_main = 0;
     }
 }
 
@@ -778,7 +946,7 @@ static void scan_claude_processes(void) {
 static int any_main_without_flag(void) {
     int i;
     for (i = 0; i < g_nprocs; i++) {
-        if (g_procs[i].is_main && process_has_gpu_flag(g_procs[i].pid) == 0) return 1;
+        if (g_procs[i].is_main && process_has_fix_flags(g_procs[i].pid) == 0) return 1;
     }
     return 0;
 }
@@ -869,14 +1037,13 @@ static void run_guardian(void) {
             /* Claude was (re)started without the flag: typically the auto-updater
                relaunching the new version. Relaunch it with the flag. */
             if (restarts >= GUARD_MAX_RESTARTS) {
-                MessageBoxW(
-                    NULL,
-                    L"Claude Desktop continua a ripartire senza --disable-gpu-compositing.\n\n"
-                    L"Cloudy ha smesso di riavviarlo automaticamente per evitare un ciclo.\n"
-                    L"Chiudi Claude e riaprilo con Cloudy (oppure usa Cloudy.exe --restart).",
-                    L"Cloudy - Guardiano",
-                    MB_OK | MB_ICONWARNING
-                );
+                static WCHAR msg[512];
+                wcopy(msg, 512, L"Claude Desktop continua a ripartire senza ");
+                wcat(msg, 512, g_fix_flags);
+                wcat(msg, 512, L".\n\n"
+                               L"Cloudy ha smesso di riavviarlo automaticamente per evitare un ciclo.\n"
+                               L"Chiudi Claude e riaprilo con Cloudy (oppure usa Cloudy.exe --restart).");
+                MessageBoxW(NULL, msg, L"Cloudy - Guardiano", MB_OK | MB_ICONWARNING);
                 break;
             }
             restarts++;
@@ -893,7 +1060,7 @@ static void run_guardian(void) {
         for (i = 0; i < g_nprocs; i++) {
             if (g_procs[i].is_main) {
                 main_idx = i;
-                flag = process_has_gpu_flag(g_procs[i].pid);
+                flag = process_has_fix_flags(g_procs[i].pid);
                 break;
             }
         }
@@ -930,6 +1097,12 @@ static void show_status(void) {
     wcat(msg_buf, 4096, g_best.version_str);
     wcat(msg_buf, 4096, L"\n\nPercorso eseguibile:\n");
     wcat(msg_buf, 4096, g_best.exe_path);
+    wcat(msg_buf, 4096, L"\n\nModalità: ");
+    wcat(msg_buf, 4096, mode_name(g_fix_mask));
+    wcat(msg_buf, 4096, L" (");
+    wcat(msg_buf, 4096, g_fix_source);
+    wcat(msg_buf, 4096, L")\nFile di configurazione: ");
+    wcat(msg_buf, 4096, g_config_path[0] ? g_config_path : L"(non determinabile)");
     wcat(msg_buf, 4096, L"\n\nArgomenti di avvio:\n");
     wcat(msg_buf, 4096, g_launch_args);
 
@@ -941,10 +1114,18 @@ static void show_status(void) {
         wcat(msg_buf, 4096, L"PID ");
         uint_to_wstr(g_procs[i].pid, num, 16);
         wcat(msg_buf, 4096, num);
-        flag = process_has_gpu_flag(g_procs[i].pid);
-        if (flag == 1) wcat(msg_buf, 4096, L" (con --disable-gpu-compositing)");
-        else if (flag == 0) wcat(msg_buf, 4096, L" (SENZA --disable-gpu-compositing: avvia Cloudy per correggerla)");
-        else wcat(msg_buf, 4096, L" (flag non verificabile)");
+        flag = process_has_fix_flags(g_procs[i].pid);
+        if (flag == 1) {
+            wcat(msg_buf, 4096, L" (con ");
+            wcat(msg_buf, 4096, g_fix_flags);
+            wcat(msg_buf, 4096, L")");
+        } else if (flag == 0) {
+            wcat(msg_buf, 4096, L" (SENZA ");
+            wcat(msg_buf, 4096, g_fix_flags);
+            wcat(msg_buf, 4096, L": avvia Cloudy per correggerla)");
+        } else {
+            wcat(msg_buf, 4096, L" (flag non verificabili)");
+        }
     }
     if (!shown) wcat(msg_buf, 4096, L"nessuna");
 
@@ -966,9 +1147,38 @@ void __stdcall WinMainCRTStartup(void) {
     int opt_status = 0;
     int opt_restart = 0;
     int opt_no_watch = 0;
-    int i;
+    int cli_mask = 0, cfg_mask, i;
+    LPCWSTR bad_cli_mode = NULL;
+    static WCHAR bad_cfg_mode[64];
 
-    wcopy(g_launch_args, 2048, GPU_FLAG);
+    /* Pass 1: fix mode from the command line (it overrides Cloudy.ini) */
+    if (argv) {
+        for (i = 1; i < argc; i++) {
+            if (weq_i(argv[i], L"--dcomp") || weq_i(argv[i], L"/dcomp")) {
+                cli_mask = FIX_DCOMP;
+            } else if (wstarts_with_i(argv[i], L"--mode=")) {
+                int m = parse_mode(argv[i] + 7);
+                if (m) cli_mask = m;
+                else bad_cli_mode = argv[i] + 7;
+            }
+        }
+    }
+
+    cfg_mask = read_config_mode(bad_cfg_mode, 64);
+    if (cfg_mask > 0) {
+        g_fix_mask = cfg_mask;
+        g_fix_source = CONFIG_NAME;
+    }
+    if (cli_mask) {
+        g_fix_mask = cli_mask;
+        g_fix_source = L"riga di comando";
+    }
+    if (cfg_mask < 0 && !cli_mask) warn_invalid_mode(CONFIG_NAME, bad_cfg_mode);
+    if (bad_cli_mode) warn_invalid_mode(L"--mode", bad_cli_mode);
+    build_fix_flags();
+
+    /* Pass 2: Cloudy options; everything else is forwarded to Claude */
+    wcopy(g_launch_args, 2048, g_fix_flags);
     if (argv) {
         for (i = 1; i < argc; i++) {
             if (weq_i(argv[i], L"--status") || weq_i(argv[i], L"/status")) {
@@ -977,7 +1187,10 @@ void __stdcall WinMainCRTStartup(void) {
                 opt_restart = 1;
             } else if (weq_i(argv[i], L"--no-watch") || weq_i(argv[i], L"/nowatch")) {
                 opt_no_watch = 1;
-            } else if (!weq_i(argv[i], GPU_FLAG)) {
+            } else if (weq_i(argv[i], L"--dcomp") || weq_i(argv[i], L"/dcomp") || wstarts_with_i(argv[i], L"--mode=")) {
+                /* already handled */
+            } else if (!((g_fix_mask & FIX_GPU) && weq_i(argv[i], FLAG_GPU)) &&
+                       !((g_fix_mask & FIX_DCOMP) && weq_i(argv[i], FLAG_DCOMP))) {
                 append_quoted_arg(g_launch_args, 2048, argv[i]);
             }
         }

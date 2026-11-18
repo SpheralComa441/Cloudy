@@ -32,6 +32,8 @@ EXPORTS
     OpenMutexW
     GetLastError
     GetTickCount
+    GetModuleFileNameW
+    CreateFileW
 EOF
 
 cat > build/ntdll.def << 'EOF'
